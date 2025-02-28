@@ -59,8 +59,8 @@ enum MimeType {
 }
 
 actor ItemProviderConverter {
-  private static func createTempURL(from url: URL) throws -> URL {
-    let fileName = "\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString).\(url.pathExtension)"
+  private static func createTempURL(from url: URL, fileExtension: String) throws -> URL {
+    let fileName = "\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString).\(fileExtension)"
     let newUrl = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
     
     // 기존 파일이 있다면 삭제
@@ -107,7 +107,7 @@ actor ItemProviderConverter {
     }
     
     do {
-      let newUrl = try createTempURL(from: url)
+      let newUrl = try createTempURL(from: url, fileExtension: url.pathExtension)
       continuation.resume(returning: newUrl)
     } catch {
       continuation.resume(throwing: error)
@@ -122,7 +122,8 @@ actor ItemProviderConverter {
     }.value
     
     return await MainActor.run {
-      let selection = PhotoVideoSelection(url: url)
+      let data = try? Data(contentsOf: url)
+      var selection = PhotoVideoSelection(url: url, data: data)
       selection.duration = duration
       
       if let thumbnailImage {
@@ -138,16 +139,12 @@ actor ItemProviderConverter {
   static func convertImageFromURL(_ url: URL) async throws -> PhotoImageSelection {
     let (data, uiImage) = try await Task.detached {
       let data = try Data(contentsOf: url)
-      
-      guard let uiImage = UIImage(data: data) else {
-        throw ServiceError(errorCode: .custom(.unknown("Failed to create image from data")))
-      }
-      
+      let uiImage = try ImageCompressor.downsample(data: data)
       return (data, uiImage)
     }.value
     
     return await MainActor.run {
-      let selection = PhotoImageSelection(image: uiImage)
+      var selection = PhotoImageSelection(image: uiImage)
       let mimeType = MimeType(url: url)
       
       switch mimeType {
@@ -162,7 +159,8 @@ actor ItemProviderConverter {
         }
       case .jpeg, .png, .unknown:
         selection.id = selection.id + ".jpg"
-        selection.imageData = uiImage.jpegData(compressionQuality: 1.0)
+        // JPEG 압축 품질 조정 (0.8은 대부분의 경우 시각적 차이가 거의 없으면서 파일 크기를 크게 줄일 수 있음)
+        selection.imageData = uiImage.jpegData(compressionQuality: 0.8)
       }
       
       selection.albumPath = url.absoluteString
@@ -170,5 +168,12 @@ actor ItemProviderConverter {
       
       return selection
     }
+  }
+  
+  private static func fixOrientation(url: URL) throws -> URL {
+    // 단순히 URL을 복사만 합니다
+    let outputURL = try createTempURL(from: url, fileExtension: "mp4")
+    try FileManager.default.copyItem(at: url, to: outputURL)
+    return outputURL
   }
 }
