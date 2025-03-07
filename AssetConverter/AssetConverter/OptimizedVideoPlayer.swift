@@ -4,13 +4,9 @@ import AVKit
 class OptimizedVideoPlayerController: ObservableObject {
     @Published private(set) var player: AVPlayer?
     @Published private(set) var isLoading = false
+    @Published private(set) var selection: PhotoVideoSelection?
     
-    private let loader = VideoLoader()
-    private let prefetcher = VideoPrefetcher()
-    private let compressor = VideoCompressor(url: URL(fileURLWithPath: ""))
-    private var playerItem: AVPlayerItem?
-    
-    // 메모리 관리를 위한 설정
+    private let videoManager = VideoManager()
     private let bufferDuration: TimeInterval = 5
     
     func load(url: URL, quality: OptimizedVideoConverter.VideoQuality = .medium) {
@@ -18,71 +14,51 @@ class OptimizedVideoPlayerController: ObservableObject {
         
         Task {
             do {
-                // 기존 플레이어 정리
                 cleanup()
                 
-                // 최적화된 URL 생성
-                let optimizedURL = url.optimizedVideoURL()
-                
-                // 캐시된 에셋 확인
-                if let cachedAsset = prefetcher.getCachedVideo(url: optimizedURL) {
-                    await MainActor.run {
-                        setupPlayer(with: cachedAsset)
-                    }
-                    return
-                }
-                
-                // 새로운 에셋 로드
-                let asset = try await loader.loadVideo(from: optimizedURL)
-                
-                // 비디오 압축 (필요한 경우)
-                if quality != .high {
-                    let compressedVideo = try await compressor.compressVideoToVideo(
-                        maxBitrateMbps: quality == .low ? 1.5 : 2.5
-                    )
-                    if let compressedURL = URL(string: compressedVideo.url) {
-                        let compressedAsset = AVAsset(url: compressedURL)
-                        await MainActor.run {
-                            setupPlayer(with: compressedAsset)
-                        }
-                        return
-                    }
-                }
+                // VideoManager를 통해 최적화된 비디오와 메타데이터 로드
+                let videoSelection = try await videoManager.loadVideoOptimized(from: url)
                 
                 await MainActor.run {
-                    setupPlayer(with: asset)
+                    self.selection = videoSelection
+                    setupPlayer(with: videoSelection)
                 }
-                
-                // 캐시에 저장
-                await prefetcher.prefetchVideo(url: optimizedURL)
-                
             } catch {
                 print("비디오 로드 실패: \(error)")
-            }
-            
-            await MainActor.run {
-                isLoading = false
+                await MainActor.run {
+                    isLoading = false
+                }
             }
         }
     }
     
-    private func setupPlayer(with asset: AVAsset) {
-        let playerItem = loader.streamVideo(from: asset.url)
-        playerItem.preferredForwardBufferDuration = bufferDuration
+    private func setupPlayer(with selection: PhotoVideoSelection) {
+        let asset = AVURLAsset(url: selection.url, options: [
+            AVURLAssetPreferPreciseDurationAndTimingKey: false,
+            AVURLAssetAllowsAirPlayKey: false
+        ])
+        
+        let playerItem = AVPlayerItem(asset: asset)
+        configurePlayerItem(playerItem)
         
         let player = AVPlayer(playerItem: playerItem)
         player.automaticallyWaitsToMinimizeStalling = true
         
-        self.playerItem = playerItem
         self.player = player
         self.isLoading = false
+    }
+    
+    private func configurePlayerItem(_ playerItem: AVPlayerItem) {
+        playerItem.preferredForwardBufferDuration = bufferDuration
+        playerItem.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+        playerItem.preferredPeakBitRate = 2_000_000 // 2Mbps
     }
     
     private func cleanup() {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
-        playerItem = nil
         player = nil
+        selection = nil
     }
     
     deinit {
@@ -94,10 +70,14 @@ struct OptimizedVideoPlayer: View {
     @StateObject private var controller = OptimizedVideoPlayerController()
     let url: URL
     let quality: OptimizedVideoConverter.VideoQuality
+    let showThumbnail: Bool
     
-    init(url: URL, quality: OptimizedVideoConverter.VideoQuality = .medium) {
+    init(url: URL, 
+         quality: OptimizedVideoConverter.VideoQuality = .medium,
+         showThumbnail: Bool = true) {
         self.url = url
         self.quality = quality
+        self.showThumbnail = showThumbnail
     }
     
     var body: some View {
@@ -110,10 +90,26 @@ struct OptimizedVideoPlayer: View {
                     .onDisappear {
                         player.pause()
                     }
+            } else if showThumbnail,
+                      let selection = controller.selection,
+                      let thumbnail = selection.thumbnailImage {
+                Image(uiImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
             }
             
             if controller.isLoading {
                 ProgressView()
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if let duration = controller.selection?.duration {
+                Text(duration)
+                    .font(.caption)
+                    .padding(4)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(4)
+                    .padding(8)
             }
         }
         .onAppear {
